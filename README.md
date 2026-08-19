@@ -37,12 +37,39 @@ The scattered env sorts the (interchangeable) sheep and dog arrays every step so
 
 `Box(-10, 10, shape=(10,))` — a `(vx, vy)` velocity command per dog, integrated with `dt = 0.01` and clipped to the field. In the scattered env each action is **held for 10 physics substeps** (action repeat), so an episode is 250 decisions over 2,500 physics steps instead of 2,500 tiny decisions.
 
-### Sheep dynamics (the part the dogs exploit)
+### Episode flow
 
-Each sheep's velocity is a sum of simple steering terms, clipped to a max speed 20x slower than the dogs:
+Each step: the policy emits 5 dog velocities → dogs move → every sheep computes its steering response (below) and moves → reward is computed from the new configuration → episode terminates if all sheep are inside the target circle, or truncates at the time limit (1,000 steps original / 250 decisions scattered).
 
-- **Flee dogs** — inverse-square repulsion `sum_j (sheep - dog_j) / |sheep - dog_j|^2`. In the original env this is **global** (any dog affects every sheep); in the scattered env it is **local** (only dogs within radius 0.3 count) — see finding #1 for why this change was necessary.
-- **Cohesion** (scattered env only) — a weak pull toward the centroid of neighbours within radius 0.2, so sheep pushed together clump and *stay* a flock.
+### Dynamics — the update equations
+
+Let $s_i$ be sheep $i$'s position, $d_j$ dog $j$'s position, $T$ the target, all in $[0,1]^2$, with $\Delta t = 0.01$.
+
+**Dogs (both tasks)** follow their commanded velocity directly, clipped to the field:
+
+$$d_j \leftarrow \mathrm{clip}\big(d_j + \mathbf{a}_j\,\Delta t,\ 0,\ 1\big), \qquad \mathbf{a}_j \in [-10, 10]^2$$
+
+In the scattered env this update runs $K{=}10$ times per policy decision with the same $\mathbf{a}_j$ (action repeat). Dogs move up to $0.1$ per substep — 20x faster than sheep.
+
+**Sheep, original task** — pure inverse-square repulsion from *every* dog, no matter how far:
+
+$$\mathbf{v}_i = \sum_{j=1}^{5} \frac{s_i - d_j}{\lVert s_i - d_j\rVert^2 + \varepsilon}, \qquad
+s_i \leftarrow \mathrm{clip}\big(s_i + \mathrm{clip}(\mathbf{v}_i, -0.5, 0.5)\,\Delta t,\ 0,\ 1\big)$$
+
+Because $\lVert\mathbf{v}\rVert = 1/\lVert s_i - d_j\rVert$ exceeds the 0.5 speed cap whenever a dog is within distance 2 (i.e. anywhere on the unit field), every sheep effectively flees at max speed at all times — fine when the flock only needs to be bulldozed diagonally, fatal for controlled gathering.
+
+**Sheep, scattered task** — repulsion becomes local (radius $R_{rep}=0.3$) and a cohesion term is added over neighbours $N_i = \{k : \lVert s_k - s_i\rVert < 0.2\}$:
+
+$$\mathbf{v}_i = \underbrace{\sum_{j:\,\lVert s_i - d_j\rVert < R_{rep}} \frac{s_i - d_j}{\lVert s_i - d_j\rVert^2 + \varepsilon}}_{\text{flee nearby dogs}}
+\; + \; \underbrace{0.3 \cdot \frac{1}{|N_i|}\sum_{k \in N_i} (s_k - s_i)}_{\text{cohere with neighbours}}$$
+
+then the same speed clip (±0.5) and position update. Sheep outside every dog's radius drift only by cohesion — so dogs must physically reach them, which is what makes gathering a real subtask.
+
+**Flock statistics and the phase flag** (scattered task): with flock center $c = \frac{1}{25}\sum_i s_i$ and flock radius $r = \frac{1}{25}\sum_i \lVert s_i - c\rVert$, the gathered flag follows a hysteresis rule so it doesn't flip-flop at the boundary:
+
+$$\text{gathered} \leftarrow \begin{cases} \text{True} & r < 0.08 \\ \text{False} & r > 0.12 \\ \text{unchanged} & \text{otherwise} \end{cases}$$
+
+This flag is part of the observation and gates the reward weights below. The 0.08 threshold is deliberate: a flock with mean radius 0.08 physically fits inside the 0.15 target circle; the earlier 0.15 threshold produced flocks that could *never* satisfy the success condition.
 
 ### Reward structure
 
@@ -57,6 +84,12 @@ Each sheep's velocity is a sum of simple steering terms, clipped to a max speed 
 | Per-sheep bonus inside target | `+2` per sheep per step |
 | **All sheep inside target** | **+10,000, episode ends** |
 
+As one formula, with $\bar{D}_{sheep} = \frac{1}{25}\sum_i \lVert s_i - T\rVert$, $\bar{D}_{dog} = \frac{1}{5}\sum_j \lVert d_j - T\rVert$, and $\Delta x = x_{prev} - x$ denoting one-step progress:
+
+$$R_t = \Delta \bar{D}_{dog} + 0.5\,\Delta \bar{D}_{sheep} - 0.5\,r_{flock} - 0.01 + 2\,\big|\{i : \lVert s_i - T\rVert < 0.15\}\big|$$
+
+$$R_t = 10{,}000 \ \text{ and episode ends, if } \lVert s_i - T\rVert < 0.15 \ \forall i$$
+
 **Scattered env** (two-phase: gather, then drive — the phase flag gates the weights):
 
 | Term | Collecting phase | Gathered phase |
@@ -69,6 +102,22 @@ Each sheep's velocity is a sum of simple steering terms, clipped to a max speed 
 | Flock spread + time | `-0.5 x radius - 0.01` (both phases) | |
 | Per-sheep bonus inside target | `+0.2` per sheep per step (kept small — see finding #2) | |
 | **All sheep inside target** | **+10,000, episode ends** | |
+
+As one formula (per decision, i.e. per 10 physics substeps), with flock radius $r$, flock center $c$, and $n_{in}$ = number of sheep inside the target circle:
+
+$$R_t = 5\,\Delta r \;+\; w_{drive}\,\Delta \bar{D}_{sheep} \;+\; \Phi_{dog} \;-\; \bar{D}_{sheep} \;-\; 0.5\,r \;-\; 0.01 \;+\; 0.2\,n_{in}$$
+
+where the phase flag selects
+
+$$w_{drive} = \begin{cases} 10 & \text{gathered} \\ 2 & \text{collecting} \end{cases}
+\qquad
+\Phi_{dog} = \begin{cases} -2 \cdot \frac{1}{5}\sum_j \lVert d_j - P_{drive}\rVert & \text{gathered} \\ \Delta\big(\frac{1}{5}\sum_j \lVert d_j - c\rVert\big) & \text{collecting} \end{cases}$$
+
+and the **driving point** sits just beyond the flock on the side opposite the target (Strömbom's driving position):
+
+$$P_{drive} = \mathrm{clip}\Big(c + \big(r_{max} + 0.08\big)\,\frac{c - T}{\lVert c - T\rVert},\ 0,\ 1\Big)$$
+
+Dogs standing at $P_{drive}$ push the flock toward the target purely through the sheep's flee response — the shaping teaches the *positioning*, and the physics does the driving. The absolute $-\bar{D}_{sheep}$ term is the anti-stall pressure: without it, a gathered flock parked anywhere is reward-neutral and PPO happily stays there. Success is the same $+10{,}000$ terminal bonus, checked every physics substep so a finish mid-decision still counts.
 
 ## Task 1 — Original clustered task
 
